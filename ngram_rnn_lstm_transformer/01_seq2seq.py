@@ -186,38 +186,35 @@ def evaluate_ngram(ngram_probs, context_counts, dataloader):
    
     log_prob_sum = 0
     total_words = 0 
-        for batch in dataloader:
-            input_ids = batch["input_ids"]
-            output_ids = batch["output_ids"]
-            
-            for inp, out in zip(input_ids, output_ids):
-                #generate the ngram BLEU
-                generated_ids = generate_ngram(ngram_probs, context_counts, inp)
-                reference.append([vocab.get_itos()[id] for id in out if id != vocab['<pad>']])
-                hypotheses.append([vocab.get_itos()[id] for id in generated_ids if id != vocab['<pad>']])
-                
-                #calculate the log probability
-                tokens = [vocab.get_itos()[id] for id in out if id != vocab['<pad>']]
-                if len(tokens) < n:
-                    continue 
-                
-                for i in range(len(tokens) - n + 1):
-                    context = tuple(tokens[i:i+n-1])
-                    next_word = tokens[i+n-1]
-                    prob = ngram_probs.get((context, next_word), 1e-7) #smoothing
-                    log_prob_sum += math.log(prob)
-                    total_words += 1
-        #calculate the BLEU score 
-        smoothing = SmoothingFunction().method1
-        bleu_score = corpus_bleu(reference, hypotheses, smoothing_function=smoothing)
+    for batch in dataloader:
+        input_ids = batch["input_ids"]
+        output_ids = batch["output_ids"]
         
-        #perplexity
-        perplexity = math.exp(-log_prob_sum / total_words) if total_words > 0 else float('inf')
-        print(f"Perplexity: {perplexity}")
+        for inp, out in zip(input_ids, output_ids):
+            #generate the ngram BLEU
+            generated_ids = generate_ngram(ngram_probs, context_counts, inp)
+            reference.append([vocab.get_itos()[id] for id in out if id != vocab['<pad>']])
+            hypotheses.append([vocab.get_itos()[id] for id in generated_ids if id != vocab['<pad>']])
+            
+            #calculate the log probability
+            tokens = [vocab.get_itos()[id] for id in out if id != vocab['<pad>']]
+            if len(tokens) < n:
+                continue 
+            
+            for i in range(len(tokens) - n + 1):
+                context = tuple(tokens[i:i+n-1])
+                next_word = tokens[i+n-1]
+                prob = ngram_probs.get((context, next_word), 1e-7) #smoothing
+                log_prob_sum += math.log(prob)
+                total_words += 1
+    #calculate the BLEU score 
+    smoothing = SmoothingFunction().method1
+    bleu_score = corpus_bleu(reference, hypotheses, smoothing_function=smoothing)
+    
+    #perplexity
+    perplexity = math.exp(-log_prob_sum / total_words) if total_words > 0 else float('inf')
+    print(f"Perplexity: {perplexity}")
         # 用MLflow记录
-        mlflow.log_metric("bleu_score", bleu_score)
-        mlflow.log_metric("perplexity", perplexity)
-        mlflow.log_param("eval_samples", len(reference))        
     return bleu_score, perplexity
 
 
