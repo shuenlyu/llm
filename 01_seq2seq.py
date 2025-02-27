@@ -1,6 +1,7 @@
 #step1 define the task: seq2seq to train QA
 #TODO: task1: seq2seq to train QA
-import torch 
+import torch
+import torch.nn as nn 
 from datasets import load_dataset 
 from torchtext.vocab import build_vocab_from_iterator
 from torchtext.data.utils import get_tokenizer
@@ -8,6 +9,9 @@ from torch.utils.data import Dataset, DataLoader
 from collections import defaultdict
 import random
 from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction 
+import math
+import mlflow  
+
 
 # 3) Define a function that processes *batches* of dialogs.
 def extract_qa_pairs(batch, context_size=3):
@@ -93,7 +97,46 @@ def train_ngram(dataloader, n=3):
     for (context, word), count in ngram_counts.items():
         ngram_probs[(context, word)] = count / context_counts[context]
         
-    return ngram_probs, context_counts 
+    return ngram_probs, context_counts
+
+#define rnn 
+class SimpleRNN(nn.Module):
+    def __init__(self, vocab_size, embed_size=128, hidden_size=256):
+        super(SimpleRNN, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_size)
+        self.rnn = nn.RNN(embed_size, hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, vocab_size)
+    def forward(self, x, hidden=None):
+        x = self.embedding(x)
+        out, hidden = self.rnn(x, hidden)
+        return self.fc(out), hidden 
+def evaluate_rnn(model, dataloader):
+    model.eval()
+    references, hypotheses = [], []
+    log_prob_sum = 0
+    total_words = 0
+    
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch["input_ids"]
+            output_ids = batch["output_ids"]
+            logits, _ = model(input_ids)
+            preds = logits.argmax(dim=-1)
+            for pred, out in zip(preds, output_ids):
+                pred_tokens = [vocab.get_itos()[id] for id in pred if id != vocab['<pad>']]
+                out_tokens = [vocab.get_itos()[id] for id in out if id != vocab['<pad>']]
+                references.append([out_tokens])
+                hypotheses.append(pred_tokens)
+                
+                #calculate the log probability
+                for i in range(len(out_tokens)):
+                    prob = logits[i, vocab[out_tokens[i]]]
+                    log_prob_sum += prob
+                    total_words += 1
+        bleu_score = corpus_bleu(references, hypotheses, smoothing_function=SmoothingFunction().method1)
+        perplexity = math.exp(-log_prob_sum / total_words) if total_words > 0 else float('inf')
+        return bleu_score, perplexity
+    
 #generate ngram 
 def generate_ngram(ngram_probs, context_counts, input_ids, max_len=20):
     input_tokens = [vocab.get_itos()[id] for id in input_ids if id != vocab['<pad>']]
@@ -140,19 +183,42 @@ def single_test(data_loader, ngram_probs, context_counts):
 def evaluate_ngram(ngram_probs, context_counts, dataloader):
     reference = []
     hypotheses = []
-    
-    for batch in dataloader:
-        input_ids = batch["input_ids"]
-        output_ids = batch["output_ids"]
+   
+    log_prob_sum = 0
+    total_words = 0 
+        for batch in dataloader:
+            input_ids = batch["input_ids"]
+            output_ids = batch["output_ids"]
+            
+            for inp, out in zip(input_ids, output_ids):
+                #generate the ngram BLEU
+                generated_ids = generate_ngram(ngram_probs, context_counts, inp)
+                reference.append([vocab.get_itos()[id] for id in out if id != vocab['<pad>']])
+                hypotheses.append([vocab.get_itos()[id] for id in generated_ids if id != vocab['<pad>']])
+                
+                #calculate the log probability
+                tokens = [vocab.get_itos()[id] for id in out if id != vocab['<pad>']]
+                if len(tokens) < n:
+                    continue 
+                
+                for i in range(len(tokens) - n + 1):
+                    context = tuple(tokens[i:i+n-1])
+                    next_word = tokens[i+n-1]
+                    prob = ngram_probs.get((context, next_word), 1e-7) #smoothing
+                    log_prob_sum += math.log(prob)
+                    total_words += 1
+        #calculate the BLEU score 
+        smoothing = SmoothingFunction().method1
+        bleu_score = corpus_bleu(reference, hypotheses, smoothing_function=smoothing)
         
-        for inp, out in zip(input_ids, output_ids):
-            generated_ids = generate_ngram(ngram_probs, context_counts, inp)
-            reference.append([vocab.get_itos()[id] for id in out if id != vocab['<pad>']])
-            hypotheses.append([vocab.get_itos()[id] for id in generated_ids if id != vocab['<pad>']])
-    #calculate the BLEU score 
-    smoothing = SmoothingFunction().method1
-    bleu_score = corpus_bleu(reference, hypotheses, smoothing_function=smoothing)
-    return bleu_score
+        #perplexity
+        perplexity = math.exp(-log_prob_sum / total_words) if total_words > 0 else float('inf')
+        print(f"Perplexity: {perplexity}")
+        # 用MLflow记录
+        mlflow.log_metric("bleu_score", bleu_score)
+        mlflow.log_metric("perplexity", perplexity)
+        mlflow.log_param("eval_samples", len(reference))        
+    return bleu_score, perplexity
 
 
 #step8 how good the model is 
@@ -220,5 +286,31 @@ if __name__ == "__main__":
     print(f"Trained {n}-gram model with {len(ngram_probs)} n-grams")
 
     #testing on test dataset 
-    bleu_score = evaluate_ngram(ngram_probs, context_counts, test_dataloader) 
+    bleu_score, perplexity = evaluate_ngram(ngram_probs, context_counts, test_dataloader) 
     print(f"BLEU score: {bleu_score}")
+    print(f"Perplexity: {perplexity}")
+    
+    #train rnn model 
+    model = SimpleRNN(len(vocab)).cuda()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.CrossEntropyLoss(ignore_index=vocab["<pad>"])
+    num_epochs = 5
+    for batch in train_dataloader:
+        input_ids = batch["input_ids"].cuda()
+        output_ids = batch["output_ids"].cuda()
+        optimizer.zero_grad()
+        logits, _ = model(input_ids)
+        loss = criterion(logits.view(-1, len(vocab)), output_ids.view(-1))
+        loss.backward()
+        optimizer.step()
+    #evaluate the rnn model
+    bleu_score_rnn, perplexity_rnn = evaluate_rnn(model, validate_dataloader)
+    print(f"BLEU score: {bleu_score_rnn}")
+    print(f"Perplexity: {perplexity_rnn}")
+    
+    with mlflow.start_run(run_name=f"ngram-rnn-lstm-transformer"): 
+    # 用MLflow记录
+        mlflow.log_metric("bleu_score_ngram", bleu_score)
+        mlflow.log_metric("perplexity_ngram", perplexity)
+        mlflow.log_metric("bleu_score_rnn", bleu_score_rnn)
+        mlflow.log_metric("perplexity_rnn", perplexity_rnn)
